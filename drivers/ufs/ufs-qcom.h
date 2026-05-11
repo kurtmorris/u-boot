@@ -128,7 +128,7 @@ struct ufs_hw_version {
 struct gpio_desc;
 
 struct ufs_qcom_priv {
-	struct phy *generic_phy;
+	struct phy generic_phy;
 	struct ufs_hba *hba;
 
 	struct clk_bulk clks;

@@ -16,6 +16,7 @@
 #include <dm/devres.h>
 #include <generic-phy.h>
 #include <malloc.h>
+#include <power/regulator.h>
 #include <reset.h>
 
 #include <asm/io.h>
@@ -38,6 +39,8 @@
 #include "phy-qcom-qmp-qserdes-txrx-v4.h"
 #include "phy-qcom-qmp-qserdes-txrx-v5.h"
 #include "phy-qcom-qmp-qserdes-txrx-ufs-v6.h"
+
+#include "../../ufs/unipro.h"
 
 /* QPHY_SW_RESET bit */
 #define SW_RESET				BIT(0)
@@ -919,6 +922,9 @@ struct qmp_ufs_priv {
 	struct reset_ctl *resets;
 	unsigned int reset_count;
 
+	struct udevice *vdda_phy;
+	struct udevice *vdda_pll;
+
 	const struct qmp_ufs_cfg *cfg;
 
 	struct udevice *dev;
@@ -1329,12 +1335,32 @@ static void qmp_ufs_pcs_init(struct qmp_ufs_priv *qmp, const struct qmp_ufs_cfg_
 
 static void qmp_ufs_init_registers(struct qmp_ufs_priv *qmp, const struct qmp_ufs_cfg *cfg)
 {
-	/* We support 'PHY_MODE_UFS_HS_B' mode & 'UFS_HS_G3' submode for now. */
+	/* Apply base tables */
 	qmp_ufs_serdes_init(qmp, &cfg->tbls);
-	qmp_ufs_serdes_init(qmp, &cfg->tbls_hs_b);
-	qmp_ufs_serdes_init(qmp, &cfg->tbls_hs_g4);
 	qmp_ufs_lanes_init(qmp, &cfg->tbls);
 	qmp_ufs_pcs_init(qmp, &cfg->tbls);
+
+	/* Apply HS-G4 lane/PCS overlay if requested */
+	if (qmp->submode >= UFS_HS_G4 &&
+	    (cfg->tbls_hs_g4.tx_num || cfg->tbls_hs_g4.rx_num ||
+	     cfg->tbls_hs_g4.pcs_num)) {
+		qmp_ufs_lanes_init(qmp, &cfg->tbls_hs_g4);
+		qmp_ufs_pcs_init(qmp, &cfg->tbls_hs_g4);
+	}
+
+	/* Apply HS-B serdes tweak if mode is HS-B */
+	if (qmp->mode == PHY_MODE_UFS_HS_B)
+		qmp_ufs_serdes_init(qmp, &cfg->tbls_hs_b);
+}
+
+static int qmp_ufs_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	struct qmp_ufs_priv *qmp = dev_get_priv(phy->dev);
+
+	qmp->mode = mode;
+	qmp->submode = submode;
+
+	return 0;
 }
 
 static int qmp_ufs_do_reset(struct qmp_ufs_priv *qmp)
@@ -1368,8 +1394,40 @@ static int qmp_ufs_power_on(struct phy *phy)
 	void __iomem *status;
 	unsigned int val;
 	int ret;
+	int i;
 
-	/* Power down PHY */
+	/* Enable regulators */
+	if (qmp->vdda_phy) {
+		ret = regulator_set_enable_if_allowed(qmp->vdda_phy, true);
+		if (ret && ret != -ENOSYS) {
+			dev_err(phy->dev, "failed to enable vdda-phy: %d\n", ret);
+			return ret;
+		}
+	}
+
+	if (qmp->vdda_pll) {
+		ret = regulator_set_enable_if_allowed(qmp->vdda_pll, true);
+		if (ret && ret != -ENOSYS) {
+			dev_err(phy->dev, "failed to enable vdda-pll: %d\n", ret);
+			if (qmp->vdda_phy)
+				regulator_set_enable_if_allowed(qmp->vdda_phy, false);
+			return ret;
+		}
+	}
+
+	/* Enable clocks */
+	for (i = 0; i < qmp->clk_count; i++) {
+		ret = clk_enable(&qmp->clks[i]);
+		if (ret && ret != -ENOSYS) {
+			dev_err(phy->dev, "failed to enable clock %d\n", i);
+			goto err_disable_regs;
+		}
+	}
+
+	/* Ensure clean state: stop serdes */
+	qphy_clrbits(pcs, cfg->regs[QPHY_START_CTRL], SERDES_START | PCS_START);
+
+	/* Power up PHY */
 	qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL], SW_PWRDN);
 
 	qmp_ufs_init_registers(qmp, cfg);
@@ -1378,7 +1436,7 @@ static int qmp_ufs_power_on(struct phy *phy)
 		ret = qmp_ufs_do_reset(qmp);
 		if (ret) {
 			dev_err(phy->dev, "qmp reset failed\n");
-			return ret;
+			goto err_disable_clks;
 		}
 	}
 
@@ -1393,36 +1451,62 @@ static int qmp_ufs_power_on(struct phy *phy)
 	ret = readl_poll_timeout(status, val, (val & PCS_READY), PHY_INIT_COMPLETE_TIMEOUT);
 	if (ret) {
 		dev_err(phy->dev, "phy initialization timed-out\n");
-		return ret;
+		goto err_disable_clks;
 	}
 
 	return 0;
+
+err_disable_clks:
+	for (i = 0; i < qmp->clk_count; i++)
+		clk_disable(&qmp->clks[i]);
+
+err_disable_regs:
+	if (qmp->vdda_pll)
+		regulator_set_enable_if_allowed(qmp->vdda_pll, false);
+	if (qmp->vdda_phy)
+		regulator_set_enable_if_allowed(qmp->vdda_phy, false);
+
+	return ret;
 }
 
 static int qmp_ufs_power_off(struct phy *phy)
 {
 	struct qmp_ufs_priv *qmp = dev_get_priv(phy->dev);
 	const struct qmp_ufs_cfg *cfg = qmp->cfg;
-
-	/* PHY reset */
-	qphy_setbits(qmp->pcs, cfg->regs[QPHY_SW_RESET], SW_RESET);
-
-	/* stop SerDes and Phy-Coding-Sublayer */
-	qphy_clrbits(qmp->pcs, cfg->regs[QPHY_START_CTRL],
-			SERDES_START | PCS_START);
+	int i;
 
 	/* Put PHY into POWER DOWN state: active low */
 	qphy_clrbits(qmp->pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
 			SW_PWRDN);
 
-	clk_release_all(qmp->clks, qmp->clk_count);
+	/* Disable clocks */
+	for (i = 0; i < qmp->clk_count; i++)
+		clk_disable(&qmp->clks[i]);
+
+	/* Disable regulators */
+	if (qmp->vdda_pll)
+		regulator_set_enable_if_allowed(qmp->vdda_pll, false);
+	if (qmp->vdda_phy)
+		regulator_set_enable_if_allowed(qmp->vdda_phy, false);
 
 	return 0;
 }
 
 static int qmp_ufs_vreg_init(struct udevice *dev, struct qmp_ufs_priv *qmp)
 {
-	/* TOFIX: Add regulator support, but they should be voted at boot time already */
+	int ret;
+
+	ret = device_get_supply_regulator(dev, "vdda-phy", &qmp->vdda_phy);
+	if (ret && ret != -ENOENT) {
+		dev_err(dev, "failed to get vdda-phy supply: %d\n", ret);
+		return ret;
+	}
+
+	ret = device_get_supply_regulator(dev, "vdda-pll", &qmp->vdda_pll);
+	if (ret && ret != -ENOENT) {
+		dev_err(dev, "failed to get vdda-pll supply: %d\n", ret);
+		return ret;
+	}
 
 	return 0;
 }
@@ -1653,6 +1737,7 @@ static int qmp_ufs_probe(struct udevice *dev)
 }
 
 static struct phy_ops qmp_ufs_ops = {
+	.set_mode = qmp_ufs_set_mode,
 	.power_on = qmp_ufs_power_on,
 	.power_off = qmp_ufs_power_off,
 };

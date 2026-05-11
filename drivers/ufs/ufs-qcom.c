@@ -214,7 +214,7 @@ static u32 ufs_qcom_get_hs_gear(struct ufs_hba *hba)
 	 * but so far pwr_mode switch is failing on v4 controllers and HS Gear 4.
 	 * only enable HS Gear > 3 for Controlers major version 5 and later.
 	 */
-	if (priv->hw_ver.major > 0x4)
+	if (priv->hw_ver.major >= 0x4)
 		return UFS_QCOM_MAX_GEAR(ufshcd_readl(hba, REG_UFS_PARAM0));
 
 	/* Default is HS-G3 */
@@ -244,7 +244,7 @@ static int ufs_get_max_pwr_mode(struct ufs_hba *hba,
 static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
 {
 	struct ufs_qcom_priv *priv = dev_get_priv(hba->dev);
-	struct phy phy;
+	u32 max_gear;
 	int ret;
 
 	/* Reset UFS Host Controller and PHY */
@@ -253,24 +253,31 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
 		dev_warn(hba->dev, "%s: host reset returned %d\n",
 			 __func__, ret);
 
-	/* get phy */
-	ret = generic_phy_get_by_name(hba->dev, "ufsphy", &phy);
-	if (ret) {
-		dev_warn(hba->dev, "%s: Unable to get QMP ufs phy, ret = %d\n",
+	/* power off phy to ensure clean state, then re-init */
+	ret = generic_phy_power_off(&priv->generic_phy);
+	if (ret)
+		dev_warn(hba->dev, "%s: phy power off returned %d\n",
 			 __func__, ret);
-		return ret;
-	}
 
 	/* phy initialization */
-	ret = generic_phy_init(&phy);
+	ret = generic_phy_init(&priv->generic_phy);
 	if (ret) {
 		dev_err(hba->dev, "%s: phy init failed, ret = %d\n",
 			__func__, ret);
 		return ret;
 	}
 
+	/* set phy mode and gear before power on */
+	max_gear = ufs_qcom_get_hs_gear(hba);
+	ret = generic_phy_set_mode(&priv->generic_phy, PHY_MODE_UFS_HS_A, max_gear);
+	if (ret) {
+		dev_err(hba->dev, "%s: phy set mode failed, ret = %d\n",
+			__func__, ret);
+		goto out_disable_phy;
+	}
+
 	/* power on phy */
-	ret = generic_phy_power_on(&phy);
+	ret = generic_phy_power_on(&priv->generic_phy);
 	if (ret) {
 		dev_err(hba->dev, "%s: phy power on failed, ret = %d\n",
 			__func__, ret);
@@ -282,7 +289,7 @@ static int ufs_qcom_power_up_sequence(struct ufs_hba *hba)
 	return 0;
 
 out_disable_phy:
-	generic_phy_exit(&phy);
+	generic_phy_exit(&priv->generic_phy);
 
 	return ret;
 }
@@ -312,7 +319,9 @@ static int ufs_qcom_hce_enable_notify(struct ufs_hba *hba,
 
 	switch (status) {
 	case PRE_CHANGE:
-		ufs_qcom_power_up_sequence(hba);
+		err = ufs_qcom_power_up_sequence(hba);
+		if (err)
+			return err;
 		/*
 		 * The PHY PLL output is the source of tx/rx lane symbol
 		 * clocks, hence, enable the lane clocks only after PHY
@@ -499,6 +508,29 @@ static u32 ufs_qcom_get_local_unipro_ver(struct ufs_hba *hba)
 	}
 }
 
+static int ufs_qcom_cfg_timers(struct ufs_hba *hba)
+{
+	struct ufs_qcom_priv *priv = dev_get_priv(hba->dev);
+	unsigned long clk_freq;
+	u32 core_clk_cycles_per_us;
+
+	/* Mandatory for V4.0.0 onwards */
+	if (priv->hw_ver.major < 4)
+		return 0;
+
+	clk_freq = ufs_qcom_get_core_clk_unipro_max_freq(hba);
+	if (clk_freq < DEFAULT_CLK_RATE_HZ)
+		clk_freq = DEFAULT_CLK_RATE_HZ;
+
+	core_clk_cycles_per_us = clk_freq / 1000000L;
+	if (ufshcd_readl(hba, REG_UFS_SYS1CLK_1US) != core_clk_cycles_per_us) {
+		ufshcd_writel(hba, core_clk_cycles_per_us, REG_UFS_SYS1CLK_1US);
+		ufshcd_readl(hba, REG_UFS_SYS1CLK_1US);
+	}
+
+	return 0;
+}
+
 static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 					enum ufs_notify_change_status status)
 {
@@ -506,6 +538,12 @@ static int ufs_qcom_link_startup_notify(struct ufs_hba *hba,
 
 	switch (status) {
 	case PRE_CHANGE:
+		if (ufs_qcom_cfg_timers(hba)) {
+			dev_err(hba->dev, "%s: ufs_qcom_cfg_timers() failed\n",
+				__func__);
+			return -EINVAL;
+		}
+
 		err = ufs_qcom_set_core_clk_ctrl(hba);
 		if (err)
 			dev_err(hba->dev, "cfg core clk ctrl failed\n");
@@ -596,19 +634,22 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 		return err;
 	}
 
-	/* setup clocks */
-	ufs_qcom_setup_clocks(hba, true, PRE_CHANGE);
-
-	if (priv->hw_ver.major >= 0x4)
-		ufshcd_dme_set(hba,
-			       UIC_ARG_MIB(PA_TXHSADAPTTYPE),
-			       PA_NO_ADAPT);
-
-	ufs_qcom_setup_clocks(hba, true, POST_CHANGE);
+	/* get phy handle so power_up_sequence can use it later */
+	err = generic_phy_get_by_name(hba->dev, "ufsphy", &priv->generic_phy);
+	if (err) {
+		dev_warn(hba->dev, "%s: Unable to get QMP ufs phy, ret = %d\n",
+			 __func__, err);
+		return err;
+	}
 
 	ufs_qcom_get_controller_revision(hba, &priv->hw_ver.major,
 					 &priv->hw_ver.minor,
 					 &priv->hw_ver.step);
+
+	/* setup clocks */
+	ufs_qcom_setup_clocks(hba, true, PRE_CHANGE);
+
+	ufs_qcom_setup_clocks(hba, true, POST_CHANGE);
 	dev_info(hba->dev, "Qcom UFS HC version: %d.%d.%d\n",
 		 priv->hw_ver.major,
 		 priv->hw_ver.minor,
@@ -644,6 +685,16 @@ static int ufs_qcom_device_reset(struct ufs_hba *hba)
 	udelay(10);
 
 	return 0;
+}
+
+static void ufs_qcom_exit(struct ufs_hba *hba)
+{
+	struct ufs_qcom_priv *priv = dev_get_priv(hba->dev);
+
+	if (priv->generic_phy.dev) {
+		generic_phy_power_off(&priv->generic_phy);
+		generic_phy_exit(&priv->generic_phy);
+	}
 }
 
 static struct ufs_hba_ops ufs_qcom_hba_ops = {
@@ -683,6 +734,10 @@ static int ufs_qcom_probe(struct udevice *dev)
 	ret = ufshcd_probe(dev, &ufs_qcom_hba_ops);
 	if (ret) {
 		dev_err(dev, "ufshcd_probe() failed, ret:%d\n", ret);
+		if (priv->generic_phy.dev) {
+			generic_phy_power_off(&priv->generic_phy);
+			generic_phy_exit(&priv->generic_phy);
+		}
 		return ret;
 	}
 
